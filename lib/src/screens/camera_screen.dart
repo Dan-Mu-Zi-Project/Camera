@@ -108,45 +108,118 @@ class _CameraScreenState extends State<CameraScreen>
 
   Future<void> _initSpeech() async {
     bool available = await _speech.initialize(
+      // onError: 에러 발생 시 호출될 콜백 함수
+      onError: (error) {
+        logError('STT', 'Error: $error');
+        // 에러 발생 시 리스닝 재시작 로직 추가 가능
+        _restartListening();
+      },
+      // onStatus: STT 상태 변경 시 호출될 콜백 함수 (listening, notListening, done 등)
       onStatus: (status) {
+        logError(
+            'STT Status', 'Status: $status, Listening: ${_speech.isListening}');
         setState(() {
           _isListening = _speech.isListening;
         });
-        // STT가 꺼지면 자동 재시작
-        if (status == 'done' || status == 'notListening') {
-          Future.delayed(const Duration(milliseconds: 300), () {
-            if (mounted && !_speech.isListening) {
-              _speech.listen(
-                onResult: (result) {
-                  setState(() {
-                    _lastWords = result.recognizedWords;
-                  });
-                },
-                listenMode: stt.ListenMode.dictation,
-                partialResults: true,
-                cancelOnError: false,
-                localeId: 'ko_KR', // 한국어 인식
-              );
-            }
-          });
+        // STT가 중지되면 (done 또는 notListening) 자동 재시작
+        if (!_isListening && mounted) {
+          _restartListening();
         }
       },
-      onError: (error) {
-        logError('STT', 'Error: $error');
-      },
+      // debugLogging: 상세 디버그 로그 출력 여부 (기본값: false)
+      // debugLogging: true,
+      // finalTimeout: 최종 결과 인식 전 대기 시간 (기본값: 2초)
+      // finalTimeout: const Duration(milliseconds: 3000),
+      // options: 플랫폼별 특정 옵션 설정 (예: 안드로이드 블루투스 비활성화)
+      // options: [stt.SpeechToText.androidNoBluetooth],
     );
+
+    logError('STT Init', 'Available: $available');
     if (available) {
-      _speech.listen(
-        onResult: (result) {
-          setState(() {
-            _lastWords = result.recognizedWords;
-          });
-        },
+      _startListening(); // 초기화 성공 시 리스닝 시작
+    } else {
+      logError(
+          'STT Init', 'The user has denied the use of speech recognition.');
+      // 사용자에게 권한 필요 알림 표시 등의 처리
+    }
+  }
+
+  // 리스닝 시작 함수
+  void _startListening() {
+    if (!_speech.isAvailable || _speech.isListening) {
+      logError('STT Start', 'Not available or already listening.');
+      return;
+    }
+    logError('STT Start', 'Starting listening...');
+    _speech
+        .listen(
+      // onResult: 음성 인식 결과 수신 시 호출될 콜백 함수
+      onResult: (result) {
+        setState(() {
+          _lastWords = result.recognizedWords;
+          logError(
+              'STT Result', 'Words: $_lastWords, Final: ${result.finalResult}');
+        });
+        // 특정 단어 감지 로직 (예: "촬영", "캡처")
+        if (result.finalResult &&
+            (_lastWords.contains('촬영') || _lastWords.contains('캡처'))) {
+          logError('STT Command', 'Capture command detected!');
+          _takePicture();
+        }
+      },
+      // localeId: 인식할 언어 설정 (예: 'ko_KR', 'en_US')
+      localeId: 'ko_KR',
+      // onSoundLevelChange: 마이크 입력 사운드 레벨 변경 시 호출될 콜백 함수
+      // onSoundLevelChange: (level) => print('Sound level: $level'),
+
+      // --- SpeechListenOptions ---
+      listenOptions: stt.SpeechListenOptions(
+        // listenMode: 인식 모드 설정 (dictation: 긴 문장, confirmation: 짧은 확인, search: 검색어)
         listenMode: stt.ListenMode.dictation,
+        // partialResults: 중간 인식 결과 반환 여부 (기본값: true)
         partialResults: true,
-        cancelOnError: false,
-        localeId: 'ko_KR', // 한국어 인식
-      );
+        // cancelOnError: 영구적인 에러 발생 시 자동 취소 여부 (기본값: false)
+        // cancelOnError: true, // true로 설정 시 onError 콜백에서 재시작 로직 필요 없을 수 있음
+        // onDevice: 기기 내 오프라인 인식 시도 여부 (기본값: false)
+        // onDevice: true, // true 설정 시 네트워크 연결 없이 동작 가능하나, 지원 및 성능 제한적일 수 있음
+        // autoPunctuation: 자동 구두점 추가 여부 (지원 플랫폼 제한적)
+        // autoPunctuation: true,
+        // enableHapticFeedback: 인식 시작/중지 시 햅틱 피드백 활성화 여부 (지원 플랫폼 제한적)
+        // enableHapticFeedback: true,
+        // sampleRate: 오디오 샘플링 레이트 (기본값: 0, 일부 iOS 기기 호환성 문제 시 44100 시도)
+        // sampleRate: 44100,
+      ),
+      // listenFor: 최대 연속 리스닝 시간 (설정 시 시간이 지나면 자동으로 중지됨)
+      // listenFor: const Duration(minutes: 5),
+      // pauseFor: 음성 입력 간 최대 пауза 시간 (설정 시 пауза 시간이 지나면 자동으로 중지됨)
+      // pauseFor: const Duration(seconds: 5),
+    )
+        .then((_) {
+      logError('STT Listen', 'Listen method called successfully.');
+    }).catchError((e) {
+      logError('STT Listen Error', 'Error starting listener: $e');
+      // 리스닝 시작 실패 시 재시도 로직
+      _restartListening();
+    });
+    setState(() {
+      _isListening = true; // listen 호출 직후 상태 업데이트
+    });
+  }
+
+  // 리스닝 재시작 함수 (딜레이 포함)
+  void _restartListening() {
+    if (mounted) {
+      // 위젯이 여전히 마운트 상태인지 확인
+      Future.delayed(const Duration(milliseconds: 500), () {
+        // 약간의 딜레이 후 재시작
+        if (mounted && _speech.isAvailable && !_speech.isListening) {
+          logError('STT Restart', 'Restarting listening...');
+          _startListening();
+        } else {
+          logError('STT Restart',
+              'Cannot restart. Mounted: $mounted, Available: ${_speech.isAvailable}, Listening: ${_speech.isListening}');
+        }
+      });
     }
   }
 
@@ -158,7 +231,7 @@ class _CameraScreenState extends State<CameraScreen>
     });
     _orientationService?.stop();
     _accelSubscription?.cancel(); // Cancel accelerometer subscription
-    _speech.stop();
+    _speech.stop(); // STT 중지
     super.dispose();
   }
 
@@ -265,9 +338,8 @@ class _CameraScreenState extends State<CameraScreen>
       // 해상도를 high로 변경
       ResolutionPreset.ultraHigh,
       enableAudio: false,
-      imageFormatGroup: Platform.isAndroid
-          ? ImageFormatGroup.nv21
-          : ImageFormatGroup.bgra8888, // iOS는 bgra8888 유지
+      // iOS 관련 코드 제거, Android 기본값 사용
+      imageFormatGroup: ImageFormatGroup.nv21,
     );
     _initializeControllerFuture = _controller!.initialize().then((_) {
       if (!mounted) return;
