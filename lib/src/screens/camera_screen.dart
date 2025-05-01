@@ -12,6 +12,9 @@ import 'package:flutter/rendering.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter/foundation.dart'; // Import for compute
 import 'package:image_gallery_saver_plus/image_gallery_saver_plus.dart';
+import 'package:sensors_plus/sensors_plus.dart'; // Import sensors_plus
+import 'package:speech_to_text/speech_to_text.dart'
+    as stt; // Import speech_to_text
 
 import '../utils/logger.dart'; // Import logger
 import '../utils/image_utils.dart'; // Import image utils
@@ -53,6 +56,14 @@ class _CameraScreenState extends State<CameraScreen>
 
   Duration? _lastShutterDuration; // 마지막 셔터 지속 시간
 
+  // --- Device Rotation ---
+  int _deviceRotationDegrees = 0;
+  StreamSubscription? _accelSubscription;
+
+  late stt.SpeechToText _speech;
+  bool _isListening = false;
+  String _lastWords = '';
+
   List<CameraDescription> get cameras =>
       widget.cameras; // Access cameras via widget
 
@@ -73,6 +84,70 @@ class _CameraScreenState extends State<CameraScreen>
       });
     });
     _orientationService!.start();
+
+    // Accelerometer subscription for device rotation
+    _accelSubscription = accelerometerEvents.listen((AccelerometerEvent event) {
+      if (event.y.abs() > event.x.abs()) {
+        if (event.y < 0) {
+          _deviceRotationDegrees = 0; // 세로(정방향)
+        } else {
+          _deviceRotationDegrees = 180; // 세로(거꾸로)
+        }
+      } else {
+        if (event.x > 0) {
+          _deviceRotationDegrees = 90; // 가로(왼쪽이 위)
+        } else {
+          _deviceRotationDegrees = 270; // 가로(오른쪽이 위)
+        }
+      }
+    });
+
+    _speech = stt.SpeechToText();
+    _initSpeech();
+  }
+
+  Future<void> _initSpeech() async {
+    bool available = await _speech.initialize(
+      onStatus: (status) {
+        setState(() {
+          _isListening = _speech.isListening;
+        });
+        // STT가 꺼지면 자동 재시작
+        if (status == 'done' || status == 'notListening') {
+          Future.delayed(const Duration(milliseconds: 300), () {
+            if (mounted && !_speech.isListening) {
+              _speech.listen(
+                onResult: (result) {
+                  setState(() {
+                    _lastWords = result.recognizedWords;
+                  });
+                },
+                listenMode: stt.ListenMode.dictation,
+                partialResults: true,
+                cancelOnError: false,
+                localeId: 'ko_KR', // 한국어 인식
+              );
+            }
+          });
+        }
+      },
+      onError: (error) {
+        logError('STT', 'Error: $error');
+      },
+    );
+    if (available) {
+      _speech.listen(
+        onResult: (result) {
+          setState(() {
+            _lastWords = result.recognizedWords;
+          });
+        },
+        listenMode: stt.ListenMode.dictation,
+        partialResults: true,
+        cancelOnError: false,
+        localeId: 'ko_KR', // 한국어 인식
+      );
+    }
   }
 
   @override
@@ -82,6 +157,8 @@ class _CameraScreenState extends State<CameraScreen>
       logError('Dispose Error', 'Error disposing controller: $e');
     });
     _orientationService?.stop();
+    _accelSubscription?.cancel(); // Cancel accelerometer subscription
+    _speech.stop();
     super.dispose();
   }
 
@@ -185,9 +262,12 @@ class _CameraScreenState extends State<CameraScreen>
     final CameraDescription cameraDescription = cameras[cameraIndex];
     _controller = CameraController(
       cameraDescription,
+      // 해상도를 high로 변경
       ResolutionPreset.ultraHigh,
       enableAudio: false,
-      imageFormatGroup: ImageFormatGroup.jpeg,
+      imageFormatGroup: Platform.isAndroid
+          ? ImageFormatGroup.nv21
+          : ImageFormatGroup.bgra8888, // iOS는 bgra8888 유지
     );
     _initializeControllerFuture = _controller!.initialize().then((_) {
       if (!mounted) return;
@@ -249,7 +329,9 @@ class _CameraScreenState extends State<CameraScreen>
     if (cameras.length < 2 ||
         _controller == null ||
         !_controller!.value.isInitialized ||
-        _isTakingPicture) {
+        _isTakingPicture ||
+        _isSwitchingCamera) {
+      // Prevent switching if already switching
       logError(
           'Switch Camera Info', 'Cannot switch camera - conditions not met.');
       return;
@@ -258,13 +340,13 @@ class _CameraScreenState extends State<CameraScreen>
       _showPreview = false;
       _isSwitchingCamera = true;
     }); // 프리뷰 페이드 아웃 & 로딩 시작
+
     await Future.delayed(const Duration(milliseconds: 150)); // 더 빠른 전환
     int nextCameraIndex = (_selectedCameraIndex + 1) % cameras.length;
     await _initializeCamera(nextCameraIndex);
     await Future.delayed(const Duration(milliseconds: 80)); // 새 프리뷰 준비 시간
     setState(() {
       _showPreview = true;
-      _isSwitchingCamera = false;
     }); // 프리뷰 페이드 인 & 로딩 종료
   }
 
@@ -334,6 +416,26 @@ class _CameraScreenState extends State<CameraScreen>
     setState(() {
       _showFlash = false;
     });
+  }
+
+  Widget _buildSpeechIndicator() {
+    return Positioned(
+      top: 100,
+      right: 20,
+      child: Container(
+        padding: EdgeInsets.all(8),
+        decoration: BoxDecoration(
+          color: _isListening ? Colors.green : Colors.grey,
+          borderRadius: BorderRadius.circular(8),
+        ),
+        child: Text(
+          _isListening
+              ? (_lastWords.isEmpty ? 'Listening...' : _lastWords)
+              : 'STT OFF',
+          style: TextStyle(color: Colors.white),
+        ),
+      ),
+    );
   }
 
   @override
@@ -407,6 +509,7 @@ class _CameraScreenState extends State<CameraScreen>
               alignment: Alignment.bottomCenter,
               child: _buildControlBar(),
             ),
+            _buildSpeechIndicator(),
           ],
         ),
       ),
