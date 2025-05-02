@@ -13,8 +13,12 @@ import 'package:flutter/services.dart';
 import 'package:flutter/foundation.dart'; // Import for compute
 import 'package:image_gallery_saver_plus/image_gallery_saver_plus.dart';
 import 'package:sensors_plus/sensors_plus.dart'; // Import sensors_plus
-import 'package:speech_to_text/speech_to_text.dart'
-    as stt; // Import speech_to_text
+import 'package:porcupine_flutter/porcupine_manager.dart'; // Import Porcupine
+import 'package:porcupine_flutter/porcupine_error.dart'; // Import Porcupine exceptions
+import 'package:rhino_flutter/rhino.dart'; // Import Rhino
+import 'package:rhino_flutter/rhino_manager.dart'; // Import RhinoManager
+import 'package:rhino_flutter/rhino_error.dart'; // Import Rhino exceptions
+import 'package:flutter_dotenv/flutter_dotenv.dart'; // Import flutter_dotenv
 
 import '../utils/logger.dart'; // Import logger
 import '../utils/image_utils.dart'; // Import image utils
@@ -23,6 +27,13 @@ import 'error_screen.dart'; // Import error screen
 import 'gallery_screen.dart'; // Import the new gallery screen
 import '../widgets/shutter_button.dart';
 import '../widgets/thumbnail_widget.dart';
+
+enum ListeningState {
+  idle, // 초기 상태 또는 오류
+  waitingForWakeWord, // Porcupine 활성화
+  waitingForCommand, // Rhino 활성화
+  processingCommand // Rhino 처리 중 (옵션)
+}
 
 class CameraScreen extends StatefulWidget {
   final List<CameraDescription> cameras; // Receive cameras list
@@ -60,9 +71,23 @@ class _CameraScreenState extends State<CameraScreen>
   int _deviceRotationDegrees = 0;
   StreamSubscription? _accelSubscription;
 
-  late stt.SpeechToText _speech;
-  bool _isListening = false;
-  String _lastWords = '';
+  // --- Porcupine Wake Word ---
+  PorcupineManager? _porcupineManager;
+  String? _porcupineError;
+
+  // --- Rhino Speech-to-Intent ---
+  RhinoManager? _rhinoManager;
+  String? _rhinoError;
+  RhinoInference? _lastInference; // Store last inference result
+
+  // --- Combined Listening State ---
+  ListeningState _listeningState = ListeningState.idle;
+  String? _errorMessage; // Combined error message
+
+  // --- Picovoice Access Key ---
+  // Read from environment variable, provide a fallback if needed
+  final String _picovoiceAccessKey =
+      dotenv.env['PICOVOICE_ACCESS_KEY'] ?? "YOUR_FALLBACK_KEY";
 
   List<CameraDescription> get cameras =>
       widget.cameras; // Access cameras via widget
@@ -71,6 +96,22 @@ class _CameraScreenState extends State<CameraScreen>
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
+
+    // Check if the access key was loaded correctly
+    if (_picovoiceAccessKey == "YOUR_FALLBACK_KEY") {
+      logError(
+          'Access Key Error', 'PICOVOICE_ACCESS_KEY not found in .env file!');
+      // Optionally set an error state here
+      setState(() {
+        _errorMessage = "Picovoice Access Key not found";
+        _listeningState = ListeningState.idle;
+      });
+      // Prevent further initialization if key is missing
+      // return; // Or handle differently
+    } else {
+      logError('Access Key Info', 'Picovoice Access Key loaded successfully.');
+    }
+
     if (cameras.isNotEmpty) {
       _initializeCamera(0);
     } else {
@@ -102,124 +143,297 @@ class _CameraScreenState extends State<CameraScreen>
       }
     });
 
-    _speech = stt.SpeechToText();
-    _initSpeech();
-  }
-
-  Future<void> _initSpeech() async {
-    bool available = await _speech.initialize(
-      // onError: 에러 발생 시 호출될 콜백 함수
-      onError: (error) {
-        logError('STT', 'Error: $error');
-        // 에러 발생 시 리스닝 재시작 로직 추가 가능
-        _restartListening();
-      },
-      // onStatus: STT 상태 변경 시 호출될 콜백 함수 (listening, notListening, done 등)
-      onStatus: (status) {
-        logError(
-            'STT Status', 'Status: $status, Listening: ${_speech.isListening}');
-        setState(() {
-          _isListening = _speech.isListening;
-        });
-        // STT가 중지되면 (done 또는 notListening) 자동 재시작
-        if (!_isListening && mounted) {
-          _restartListening();
-        }
-      },
-      // debugLogging: 상세 디버그 로그 출력 여부 (기본값: false)
-      // debugLogging: true,
-      // finalTimeout: 최종 결과 인식 전 대기 시간 (기본값: 2초)
-      // finalTimeout: const Duration(milliseconds: 3000),
-      // options: 플랫폼별 특정 옵션 설정 (예: 안드로이드 블루투스 비활성화)
-      // options: [stt.SpeechToText.androidNoBluetooth],
-    );
-
-    logError('STT Init', 'Available: $available');
-    if (available) {
-      _startListening(); // 초기화 성공 시 리스닝 시작
-    } else {
-      logError(
-          'STT Init', 'The user has denied the use of speech recognition.');
-      // 사용자에게 권한 필요 알림 표시 등의 처리
+    // --- Initialize Porcupine ---
+    // Only initialize if the key was loaded and no error state set
+    if (_listeningState != ListeningState.idle || _errorMessage == null) {
+      _initPorcupine();
     }
   }
 
-  // 리스닝 시작 함수
-  void _startListening() {
-    if (!_speech.isAvailable || _speech.isListening) {
-      logError('STT Start', 'Not available or already listening.');
+  // --- Porcupine Initialization ---
+  Future<void> _initPorcupine() async {
+    // Ensure access key is set
+    if (_picovoiceAccessKey == "YOUR_PICOVOICE_ACCESS_KEY") {
+      logError('Porcupine Init Error',
+          'Please replace "YOUR_PICOVOICE_ACCESS_KEY" with your actual key.');
+      setState(() {
+        _errorMessage = "Missing Picovoice Access Key";
+        _listeningState = ListeningState.idle;
+      });
       return;
     }
-    logError('STT Start', 'Starting listening...');
-    _speech
-        .listen(
-      // onResult: 음성 인식 결과 수신 시 호출될 콜백 함수
-      onResult: (result) {
-        setState(() {
-          _lastWords = result.recognizedWords;
-          logError(
-              'STT Result', 'Words: $_lastWords, Final: ${result.finalResult}');
-        });
-        // 특정 단어 감지 로직 (예: "촬영", "캡처")
-        if (result.finalResult &&
-            (_lastWords.contains('촬영') || _lastWords.contains('캡처'))) {
-          logError('STT Command', 'Capture command detected!');
-          _takePicture();
-        }
-      },
-      // localeId: 인식할 언어 설정 (예: 'ko_KR', 'en_US')
-      localeId: 'ko_KR',
-      // onSoundLevelChange: 마이크 입력 사운드 레벨 변경 시 호출될 콜백 함수
-      // onSoundLevelChange: (level) => print('Sound level: $level'),
 
-      // --- SpeechListenOptions ---
-      listenOptions: stt.SpeechListenOptions(
-        // listenMode: 인식 모드 설정 (dictation: 긴 문장, confirmation: 짧은 확인, search: 검색어)
-        listenMode: stt.ListenMode.dictation,
-        // partialResults: 중간 인식 결과 반환 여부 (기본값: true)
-        partialResults: true,
-        // cancelOnError: 영구적인 에러 발생 시 자동 취소 여부 (기본값: false)
-        // cancelOnError: true, // true로 설정 시 onError 콜백에서 재시작 로직 필요 없을 수 있음
-        // onDevice: 기기 내 오프라인 인식 시도 여부 (기본값: false)
-        // onDevice: true, // true 설정 시 네트워크 연결 없이 동작 가능하나, 지원 및 성능 제한적일 수 있음
-        // autoPunctuation: 자동 구두점 추가 여부 (지원 플랫폼 제한적)
-        // autoPunctuation: true,
-        // enableHapticFeedback: 인식 시작/중지 시 햅틱 피드백 활성화 여부 (지원 플랫폼 제한적)
-        // enableHapticFeedback: true,
-        // sampleRate: 오디오 샘플링 레이트 (기본값: 0, 일부 iOS 기기 호환성 문제 시 44100 시도)
-        // sampleRate: 44100,
-      ),
-      // listenFor: 최대 연속 리스닝 시간 (설정 시 시간이 지나면 자동으로 중지됨)
-      // listenFor: const Duration(minutes: 5),
-      // pauseFor: 음성 입력 간 최대 пауза 시간 (설정 시 пауза 시간이 지나면 자동으로 중지됨)
-      // pauseFor: const Duration(seconds: 5),
-    )
-        .then((_) {
-      logError('STT Listen', 'Listen method called successfully.');
-    }).catchError((e) {
-      logError('STT Listen Error', 'Error starting listener: $e');
-      // 리스닝 시작 실패 시 재시도 로직
-      _restartListening();
-    });
-    setState(() {
-      _isListening = true; // listen 호출 직후 상태 업데이트
+    // Define asset paths (relative to pubspec.yaml assets section)
+    final String keywordAssetPath = "assets/무지야_ko_android_v3_0_0.ppn";
+    final String modelAssetPath = "assets/porcupine_params_ko.pv";
+
+    try {
+      _porcupineManager = await PorcupineManager.fromKeywordPaths(
+        _picovoiceAccessKey,
+        [keywordAssetPath], // List of keyword paths
+        _wakeWordDetected, // Callback when wake word is detected
+        modelPath:
+            modelAssetPath, // Optional: specify model path if not default
+        errorCallback: _porcupineErrorCallback, // Callback for errors
+      );
+      await _porcupineManager?.start();
+      setState(() {
+        _listeningState = ListeningState.waitingForWakeWord;
+        _errorMessage = null; // Clear any previous error
+      });
+      logError(
+          'Porcupine Init', 'Porcupine initialized and started successfully.');
+    } on PorcupineException catch (e) {
+      logError('Porcupine Init Error',
+          'Failed to initialize Porcupine: ${e.message}');
+      setState(() {
+        _errorMessage = "Porcupine Init Failed: ${e.message}";
+        _listeningState = ListeningState.idle;
+      });
+    } catch (e) {
+      logError(
+          'Porcupine Init Error', 'Unknown error initializing Porcupine: $e');
+      setState(() {
+        _errorMessage = "Unknown Porcupine Error";
+        _listeningState = ListeningState.idle;
+      });
+    }
+  }
+
+  // --- Rhino Initialization ---
+  Future<void> _initRhino() async {
+    // Ensure access key is valid before proceeding
+    if (_picovoiceAccessKey == "YOUR_FALLBACK_KEY" ||
+        _picovoiceAccessKey == "YOUR_PICOVOICE_ACCESS_KEY") {
+      logError('Rhino Init Error', 'Invalid or missing Picovoice Access Key.');
+      setState(() {
+        _errorMessage = "Invalid Picovoice Access Key";
+        _listeningState = ListeningState.idle;
+      });
+      _restartPorcupineAfterCommand(); // Attempt to go back to wake word listening
+      return;
+    }
+
+    // Define asset paths
+    final String contextAssetPath = "assets/카메라_ko_android_v3_0_0.rhn";
+    final String rhinoModelAssetPath = "assets/rhino_params_ko.pv";
+    logError('Rhino Init',
+        'Using Context: $contextAssetPath, Model: $rhinoModelAssetPath');
+
+    try {
+      logError('Rhino Init', 'Attempting to create RhinoManager...');
+      // Ensure manager is null before creating a new one
+      if (_rhinoManager != null) {
+        logError('Rhino Init Warning',
+            'Existing RhinoManager found. Deleting before creating new one.');
+        await _stopRhino(); // Clean up existing instance if any
+      }
+
+      _rhinoManager = await RhinoManager.create(
+        _picovoiceAccessKey,
+        contextAssetPath,
+        _intentDetected, // Callback when intent is detected
+        modelPath: rhinoModelAssetPath,
+        processErrorCallback: _rhinoErrorCallback,
+      );
+      logError('Rhino Init', 'RhinoManager create call completed.');
+
+      // *** Check if manager is not null AFTER creation ***
+      if (_rhinoManager != null) {
+        logError('Rhino Init',
+            'RhinoManager successfully created (instance is not null).');
+        logError('Rhino Init', 'Attempting to start Rhino processing...');
+        // Start processing audio
+        await _rhinoManager!.process(); // Use ! because we checked for null
+        logError('Rhino Init', 'Rhino processing started successfully.');
+        if (mounted) {
+          setState(() {
+            _listeningState = ListeningState.waitingForCommand;
+            _errorMessage = null; // Clear any previous error
+          });
+        }
+      } else {
+        // This case indicates create() returned null or failed silently
+        logError('Rhino Init Error',
+            'RhinoManager is NULL after creation call completed.');
+        throw RhinoInvalidStateException(
+            "RhinoManager became null unexpectedly after creation.");
+      }
+    } on RhinoException catch (e) {
+      // Catch specific Rhino exceptions (Activation, IO, InvalidState, etc.)
+      logError('Rhino Init Error',
+          'RhinoException caught: ${e.runtimeType} - ${e.message}');
+      if (mounted) {
+        setState(() {
+          _errorMessage = "Rhino Init Failed: ${e.message}";
+          _listeningState = ListeningState.idle;
+        });
+      }
+      _restartPorcupineAfterCommand();
+    } on PlatformException catch (e) {
+      // Catch potential errors from native side during create/process
+      logError('Rhino Init Error',
+          'PlatformException caught: ${e.code} - ${e.message}');
+      if (mounted) {
+        setState(() {
+          _errorMessage = "Rhino Platform Error: ${e.message}";
+          _listeningState = ListeningState.idle;
+        });
+      }
+      _restartPorcupineAfterCommand();
+    } catch (e, stackTrace) {
+      // Catch any other unexpected errors
+      logError(
+          'Rhino Init Error', 'Unknown error during Rhino initialization: $e');
+      logError('Rhino Init Error', 'Stack trace: $stackTrace');
+      if (mounted) {
+        setState(() {
+          _errorMessage = "Unknown Rhino Error";
+          _listeningState = ListeningState.idle;
+        });
+      }
+      _restartPorcupineAfterCommand();
+    }
+  }
+
+  // --- Porcupine Callbacks ---
+  void _wakeWordDetected(int keywordIndex) {
+    logError('Porcupine Wake Word', 'Wake word detected! Index: $keywordIndex');
+    // Stop Porcupine and start Rhino
+    _stopPorcupine().then((_) {
+      _initRhino(); // Initialize and wait for Rhino command
     });
   }
 
-  // 리스닝 재시작 함수 (딜레이 포함)
-  void _restartListening() {
-    if (mounted) {
-      // 위젯이 여전히 마운트 상태인지 확인
-      Future.delayed(const Duration(milliseconds: 500), () {
-        // 약간의 딜레이 후 재시작
-        if (mounted && _speech.isAvailable && !_speech.isListening) {
-          logError('STT Restart', 'Restarting listening...');
-          _startListening();
-        } else {
-          logError('STT Restart',
-              'Cannot restart. Mounted: $mounted, Available: ${_speech.isAvailable}, Listening: ${_speech.isListening}');
+  void _porcupineErrorCallback(PorcupineException error) {
+    logError('Porcupine Runtime Error', 'Error: ${error.message}');
+    setState(() {
+      _errorMessage = "Porcupine Runtime Error: ${error.message}";
+      _listeningState = ListeningState.idle;
+    });
+  }
+
+  // --- Rhino Callbacks ---
+  void _intentDetected(RhinoInference inference) {
+    logError('Rhino Intent',
+        'Inference received: understood=${inference.isUnderstood}, intent=${inference.intent}, slots=${inference.slots}');
+    setState(() {
+      _lastInference = inference; // Store for potential display or logging
+    });
+
+    if (inference.isUnderstood == true) {
+      // --- Handle Intents ---
+      switch (inference.intent) {
+        case 'takephoto':
+          logError('Rhino Intent', 'Executing: takephoto');
+          if (!_isTakingPicture) {
+            _takePicture();
+          } else {
+            logError(
+                'Rhino Intent', 'Already taking picture, ignoring command.');
+          }
+          break;
+        case 'evaluateScene':
+          logError(
+              'Rhino Intent', 'Executing: evaluateScene (Not implemented yet)');
+          ScaffoldMessenger.of(context).showSnackBar(
+              SnackBar(content: Text('Scene evaluation not implemented yet.')));
+          break;
+        case 'openGallery':
+          logError('Rhino Intent', 'Executing: openGallery');
+          if (_savedImagePaths.isNotEmpty) {
+            logError('Rhino Intent', 'Navigating to GalleryScreen');
+            Navigator.push(
+              context,
+              MaterialPageRoute(
+                builder: (_) => GalleryScreen(imagePaths: _savedImagePaths),
+              ),
+            );
+          } else {
+            logError('Rhino Intent', 'No saved images to show in gallery.');
+            ScaffoldMessenger.of(context)
+                .showSnackBar(SnackBar(content: Text('갤러리에 사진이 없습니다.')));
+          }
+          break;
+        default:
+          logError('Rhino Intent', 'Unknown intent: ${inference.intent}');
+          ScaffoldMessenger.of(context).showSnackBar(
+              SnackBar(content: Text('알 수 없는 명령입니다: ${inference.intent}')));
+      }
+    } else {
+      logError('Rhino Intent', 'Command not understood.');
+      ScaffoldMessenger.of(context)
+          .showSnackBar(SnackBar(content: Text('명령을 이해하지 못했습니다.')));
+    }
+
+    // --- Cleanup Rhino and Restart Porcupine ---
+    _restartPorcupineAfterCommand();
+  }
+
+  void _rhinoErrorCallback(RhinoException error) {
+    logError('Rhino Runtime Error', 'Error: ${error.message}');
+    setState(() {
+      _errorMessage = "Rhino Runtime Error: ${error.message}";
+      _listeningState = ListeningState.idle;
+    });
+    // Attempt to restart Porcupine after Rhino error
+    _restartPorcupineAfterCommand();
+  }
+
+  // --- Helper methods for stopping/starting managers ---
+  Future<void> _stopPorcupine() async {
+    if (_porcupineManager != null) {
+      try {
+        await _porcupineManager?.stop();
+        logError('Porcupine Control', 'Porcupine stopped.');
+      } catch (e) {
+        logError('Porcupine Control Error', 'Error stopping Porcupine: $e');
+      }
+    }
+  }
+
+  Future<void> _stopRhino() async {
+    if (_rhinoManager != null) {
+      try {
+        await _rhinoManager?.delete();
+        _rhinoManager = null; // Ensure it's null after deletion
+        logError('Rhino Control', 'Rhino deleted.');
+      } catch (e) {
+        logError('Rhino Control Error', 'Error deleting Rhino: $e');
+        setState(() {
+          _rhinoManager = null;
+        });
+      }
+    }
+  }
+
+  Future<void> _restartPorcupineAfterCommand() async {
+    await _stopRhino(); // Ensure Rhino is stopped and deleted first
+    if (_porcupineManager != null &&
+        _listeningState != ListeningState.waitingForWakeWord) {
+      try {
+        await _porcupineManager?.start();
+        if (mounted) {
+          setState(() {
+            _listeningState = ListeningState.waitingForWakeWord;
+            _errorMessage = null; // Clear Rhino errors
+          });
         }
-      });
+        logError(
+            'Porcupine Control', 'Porcupine restarted after command/error.');
+      } catch (e) {
+        logError('Porcupine Control Error', 'Error restarting Porcupine: $e');
+        if (mounted) {
+          setState(() {
+            _errorMessage = "Failed to restart Porcupine";
+            _listeningState = ListeningState.idle;
+          });
+        }
+      }
+    } else if (_porcupineManager == null) {
+      logError(
+          'Porcupine Control', 'Porcupine manager was null, re-initializing.');
+      _initPorcupine(); // Re-initialize if it was somehow deleted
     }
   }
 
@@ -230,8 +444,18 @@ class _CameraScreenState extends State<CameraScreen>
       logError('Dispose Error', 'Error disposing controller: $e');
     });
     _orientationService?.stop();
-    _accelSubscription?.cancel(); // Cancel accelerometer subscription
-    _speech.stop(); // STT 중지
+    _accelSubscription?.cancel();
+
+    // Stop and delete both managers
+    _stopPorcupine().then((_) {
+      _porcupineManager?.delete();
+      logError('Porcupine Dispose', 'Porcupine deleted.');
+    }).catchError((e) {
+      logError('Porcupine Dispose Error', 'Error deleting Porcupine: $e');
+    });
+
+    _stopRhino(); // Rhino stop/delete
+
     super.dispose();
   }
 
@@ -257,6 +481,15 @@ class _CameraScreenState extends State<CameraScreen>
           _initializeCamera(_selectedCameraIndex);
         } else {
           logError('Lifecycle Info', 'Controller already initialized.');
+        }
+        // Restart Porcupine if idle and no error
+        if (_listeningState == ListeningState.idle && _errorMessage == null) {
+          logError('Picovoice Lifecycle', 'Resuming - Restarting Porcupine.');
+          _restartPorcupineAfterCommand();
+        } else if (_listeningState == ListeningState.waitingForCommand) {
+          logError('Picovoice Lifecycle',
+              'Resuming - Was waiting for command, restarting Porcupine.');
+          _restartPorcupineAfterCommand();
         }
         break;
       case AppLifecycleState.inactive:
@@ -291,6 +524,15 @@ class _CameraScreenState extends State<CameraScreen>
               _initializeControllerFuture = null;
             });
           }
+        }
+        // Stop whichever manager is active
+        if (_listeningState == ListeningState.waitingForWakeWord) {
+          logError('Picovoice Lifecycle', 'Pausing - Stopping Porcupine.');
+          _stopPorcupine();
+        } else if (_listeningState == ListeningState.waitingForCommand) {
+          logError('Picovoice Lifecycle', 'Pausing - Stopping Rhino.');
+          _stopRhino();
+          setState(() => _listeningState = ListeningState.idle);
         }
         break;
       case AppLifecycleState.hidden:
@@ -490,21 +732,71 @@ class _CameraScreenState extends State<CameraScreen>
     });
   }
 
-  Widget _buildSpeechIndicator() {
+  // --- Modified Indicator to show Porcupine/Rhino status ---
+  Widget _buildWakeWordIndicator() {
+    String text;
+    Color color;
+    IconData icon;
+
+    if (_errorMessage != null) {
+      text = "Error";
+      color = Colors.red;
+      icon = Icons.error_outline;
+    } else {
+      switch (_listeningState) {
+        case ListeningState.waitingForWakeWord:
+          text = "무지야?"; // Waiting for "무지야"
+          color = Colors.green;
+          icon = Icons.mic_none; // Outline mic
+          break;
+        case ListeningState.waitingForCommand:
+          text = "명령하세요..."; // Waiting for command after "무지야"
+          color = Colors.blue;
+          icon = Icons.mic; // Filled mic
+          break;
+        case ListeningState.processingCommand: // Optional state
+          text = "처리중...";
+          color = Colors.orange;
+          icon = Icons.hourglass_empty;
+          break;
+        case ListeningState.idle:
+        default:
+          text = "초기화중...";
+          color = Colors.grey;
+          icon = Icons.hourglass_empty;
+          break;
+      }
+    }
+
     return Positioned(
-      top: 100,
-      right: 20,
+      top: 100, // Adjust position as needed
+      left: 20,
       child: Container(
-        padding: EdgeInsets.all(8),
+        padding: EdgeInsets.symmetric(horizontal: 12, vertical: 6),
         decoration: BoxDecoration(
-          color: _isListening ? Colors.green : Colors.grey,
-          borderRadius: BorderRadius.circular(8),
+          color: color.withOpacity(0.8),
+          borderRadius: BorderRadius.circular(20),
+          boxShadow: [
+            BoxShadow(
+              color: Colors.black.withOpacity(0.2),
+              blurRadius: 4,
+              offset: Offset(0, 2),
+            )
+          ],
         ),
-        child: Text(
-          _isListening
-              ? (_lastWords.isEmpty ? 'Listening...' : _lastWords)
-              : 'STT OFF',
-          style: TextStyle(color: Colors.white),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(icon, color: Colors.white, size: 16),
+            SizedBox(width: 6),
+            Text(
+              text,
+              style: TextStyle(
+                  color: Colors.white,
+                  fontSize: 12,
+                  fontWeight: FontWeight.bold),
+            ),
+          ],
         ),
       ),
     );
@@ -581,7 +873,8 @@ class _CameraScreenState extends State<CameraScreen>
               alignment: Alignment.bottomCenter,
               child: _buildControlBar(),
             ),
-            _buildSpeechIndicator(),
+            // --- Wake Word / Command Indicator ---
+            _buildWakeWordIndicator(),
           ],
         ),
       ),
