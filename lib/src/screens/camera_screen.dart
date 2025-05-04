@@ -222,11 +222,10 @@ class _CameraScreenState extends State<CameraScreen>
 
     try {
       logError('Rhino Init', 'Attempting to create RhinoManager...');
-      // Ensure manager is null before creating a new one
       if (_rhinoManager != null) {
         logError('Rhino Init Warning',
             'Existing RhinoManager found. Deleting before creating new one.');
-        await _stopRhino(); // Clean up existing instance if any
+        await _stopRhino();
       }
 
       _rhinoManager = await RhinoManager.create(
@@ -238,13 +237,11 @@ class _CameraScreenState extends State<CameraScreen>
       );
       logError('Rhino Init', 'RhinoManager create call completed.');
 
-      // *** Check if manager is not null AFTER creation ***
       if (_rhinoManager != null) {
         logError('Rhino Init',
             'RhinoManager successfully created (instance is not null).');
         logError('Rhino Init', 'Attempting to start Rhino processing...');
-        // Start processing audio
-        await _rhinoManager!.process(); // Use ! because we checked for null
+        await _rhinoManager!.process();
         logError('Rhino Init', 'Rhino processing started successfully.');
         if (mounted) {
           setState(() {
@@ -253,14 +250,12 @@ class _CameraScreenState extends State<CameraScreen>
           });
         }
       } else {
-        // This case indicates create() returned null or failed silently
         logError('Rhino Init Error',
             'RhinoManager is NULL after creation call completed.');
         throw RhinoInvalidStateException(
             "RhinoManager became null unexpectedly after creation.");
       }
     } on RhinoException catch (e) {
-      // Catch specific Rhino exceptions (Activation, IO, InvalidState, etc.)
       logError('Rhino Init Error',
           'RhinoException caught: ${e.runtimeType} - ${e.message}');
       if (mounted) {
@@ -271,7 +266,6 @@ class _CameraScreenState extends State<CameraScreen>
       }
       _restartPorcupineAfterCommand();
     } on PlatformException catch (e) {
-      // Catch potential errors from native side during create/process
       logError('Rhino Init Error',
           'PlatformException caught: ${e.code} - ${e.message}');
       if (mounted) {
@@ -282,7 +276,6 @@ class _CameraScreenState extends State<CameraScreen>
       }
       _restartPorcupineAfterCommand();
     } catch (e, stackTrace) {
-      // Catch any other unexpected errors
       logError(
           'Rhino Init Error', 'Unknown error during Rhino initialization: $e');
       logError('Rhino Init Error', 'Stack trace: $stackTrace');
@@ -299,9 +292,9 @@ class _CameraScreenState extends State<CameraScreen>
   // --- Porcupine Callbacks ---
   void _wakeWordDetected(int keywordIndex) {
     logError('Porcupine Wake Word', 'Wake word detected! Index: $keywordIndex');
-    // Stop Porcupine and start Rhino
-    _stopPorcupine().then((_) {
-      _initRhino(); // Initialize and wait for Rhino command
+    _stopPorcupine().then((_) async {
+      await _stopRhino(); // 혹시 남아있으면 정리
+      await _initRhino(); // 새로 생성 및 process() 호출
     });
   }
 
@@ -366,7 +359,9 @@ class _CameraScreenState extends State<CameraScreen>
           .showSnackBar(SnackBar(content: Text('명령을 이해하지 못했습니다.')));
     }
 
-    // --- Cleanup Rhino and Restart Porcupine ---
+    // 명령 처리 후 반드시 해제
+    _rhinoManager?.delete();
+    _rhinoManager = null;
     _restartPorcupineAfterCommand();
   }
 
@@ -408,10 +403,18 @@ class _CameraScreenState extends State<CameraScreen>
   }
 
   Future<void> _restartPorcupineAfterCommand() async {
-    await _stopRhino(); // Ensure Rhino is stopped and deleted first
+    // RhinoManager는 내부적으로 stop()을 호출하므로 여기서 명시적으로 _stopRhino()를 호출하지 않음
+    // 단, 혹시라도 남아있을 경우 안전하게 정리
+    if (_rhinoManager != null) {
+      logError('Porcupine Restart',
+          'Warning: RhinoManager instance still exists. Attempting explicit cleanup.');
+      await _stopRhino();
+    }
+    // Porcupine 시작 시도
     if (_porcupineManager != null &&
         _listeningState != ListeningState.waitingForWakeWord) {
       try {
+        logError('Porcupine Restart', 'Attempting to start Porcupine...');
         await _porcupineManager?.start();
         if (mounted) {
           setState(() {
@@ -419,10 +422,9 @@ class _CameraScreenState extends State<CameraScreen>
             _errorMessage = null; // Clear Rhino errors
           });
         }
-        logError(
-            'Porcupine Control', 'Porcupine restarted after command/error.');
+        logError('Porcupine Restart', 'Porcupine restarted successfully.');
       } catch (e) {
-        logError('Porcupine Control Error', 'Error restarting Porcupine: $e');
+        logError('Porcupine Restart Error', 'Error restarting Porcupine: $e');
         if (mounted) {
           setState(() {
             _errorMessage = "Failed to restart Porcupine";
@@ -431,9 +433,12 @@ class _CameraScreenState extends State<CameraScreen>
         }
       }
     } else if (_porcupineManager == null) {
-      logError(
-          'Porcupine Control', 'Porcupine manager was null, re-initializing.');
+      logError('Porcupine Restart Error',
+          'Porcupine manager was null, re-initializing.');
       _initPorcupine(); // Re-initialize if it was somehow deleted
+    } else {
+      logError('Porcupine Restart Info',
+          'Porcupine already in waiting state or manager is null.');
     }
   }
 
